@@ -71,6 +71,8 @@ void palloc_init(size_t user_page_limit)
 }
 
 static size_t palloc_scan_next_and_flip(struct pool *pool, size_t page_cnt);
+static size_t palloc_scan_best_and_flip(struct pool *pool, size_t page_cnt);
+
 /* Obtains and returns a group of PAGE_CNT contiguous free pages.
    If PAL_USER is set, the pages are obtained from the user pool,
    otherwise from the kernel pool.  If PAL_ZERO is set in FLAGS,
@@ -100,7 +102,7 @@ palloc_get_multiple(enum palloc_flags flags, size_t page_cnt)
                 pool->next_fit_idx = 0;
     }
     else if (palloc_mode == PAL_BEST_FIT)
-        page_idx = bitmap_scan_best_and_flip(pool->used_map, 0, page_cnt, false);
+        page_idx = palloc_scan_best_and_flip(pool, page_cnt);
 
     lock_release(&pool->lock);
 
@@ -120,7 +122,8 @@ palloc_get_multiple(enum palloc_flags flags, size_t page_cnt)
     return pages;
 }
 
-static size_t palloc_scan_next_and_flip(struct pool *pool, size_t page_cnt){
+static size_t palloc_scan_next_and_flip(struct pool *pool, size_t page_cnt)
+{
     size_t start = pool->next_fit_idx;
     size_t idx = bitmap_scan_and_flip(pool->used_map, start, page_cnt, false);
 
@@ -130,6 +133,40 @@ static size_t palloc_scan_next_and_flip(struct pool *pool, size_t page_cnt){
     return idx;
 }
 
+static size_t palloc_scan_best_and_flip(struct pool *pool, size_t page_cnt)
+{
+    struct bitmap* b = pool->used_map;
+    size_t bit_cnt = bitmap_size(b);
+
+    size_t best_idx = BITMAP_ERROR;
+    size_t min_len = SIZE_MAX;
+
+    size_t idx = 0;
+    while(idx < bit_cnt){
+        size_t hole_start = bitmap_scan(b, idx, page_cnt, false);
+        if (hole_start == BITMAP_ERROR)
+            break;
+        
+        size_t hole_end = bitmap_scan(b, hole_start, 1, true);
+        if (hole_end == BITMAP_ERROR)
+            hole_end = bit_cnt;
+
+        size_t hole_len = hole_end - hole_start;
+
+        if (hole_len < min_len){
+            best_idx = hole_start;
+            min_len = hole_len;
+
+            if(min_len == page_cnt)
+                break;
+        }
+        idx = hole_end;
+    }
+    if(best_idx != BITMAP_ERROR)
+        bitmap_set_multiple(b, best_idx, page_cnt, true);
+
+    return best_idx;
+}
 /* Obtains a single free page and returns its kernel virtual
    address.
    If PAL_USER is set, the page is obtained from the user pool,
