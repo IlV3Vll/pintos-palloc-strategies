@@ -30,6 +30,7 @@ struct pool {
     struct lock lock;        /* Mutual exclusion. */
     struct bitmap *used_map; /* Bitmap of free pages. */
     uint8_t *base;           /* Base of pool. */
+    size_t next_fit_idx;
 };
 
 /* Two pools: one for kernel data, one for user pages. */
@@ -69,6 +70,7 @@ void palloc_init(size_t user_page_limit)
               user_pages, "user pool");
 }
 
+static size_t palloc_scan_next_and_flip(struct pool *pool, size_t page_cnt);
 /* Obtains and returns a group of PAGE_CNT contiguous free pages.
    If PAL_USER is set, the pages are obtained from the user pool,
    otherwise from the kernel pool.  If PAL_ZERO is set in FLAGS,
@@ -86,7 +88,20 @@ palloc_get_multiple(enum palloc_flags flags, size_t page_cnt)
         return NULL;
 
     lock_acquire(&pool->lock);
-    page_idx = bitmap_scan_and_flip(pool->used_map, 0, page_cnt, false);
+
+    if (palloc_mode == PAL_FIRST_FIT)
+        page_idx = bitmap_scan_and_flip(pool->used_map, 0, page_cnt, false);
+    else if(palloc_mode == PAL_NEXT_FIT){
+        page_idx = palloc_scan_next_and_flip(pool, page_cnt);
+
+        if(page_idx != BITMAP_ERROR)
+            pool->next_fit_idx = page_idx + page_cnt;
+            if (pool->next_fit_idx >= bitmap_size(pool->used_map))
+                pool->next_fit_idx = 0;
+    }
+    else if (palloc_mode == PAL_BEST_FIT)
+        page_idx = bitmap_scan_best_and_flip(pool->used_map, 0, page_cnt, false);
+
     lock_release(&pool->lock);
 
     if (page_idx != BITMAP_ERROR)
@@ -103,6 +118,16 @@ palloc_get_multiple(enum palloc_flags flags, size_t page_cnt)
     }
 
     return pages;
+}
+
+static size_t palloc_scan_next_and_flip(struct pool *pool, size_t page_cnt){
+    size_t start = pool->next_fit_idx;
+    size_t idx = bitmap_scan_and_flip(pool->used_map, start, page_cnt, false);
+
+    if(idx == BITMAP_ERROR)
+        idx = bitmap_scan_and_flip(pool->used_map, 0, page_cnt, false);
+    
+    return idx;
 }
 
 /* Obtains a single free page and returns its kernel virtual
@@ -186,6 +211,7 @@ init_pool(struct pool *p, void *base, size_t page_cnt, const char *name)
     lock_init(&p->lock);
     p->used_map = bitmap_create_in_buf(page_cnt, base, bm_pages * PGSIZE);
     p->base = base + bm_pages * PGSIZE;
+    p->next_fit_idx = 0;
 }
 
 /* Returns true if PAGE was allocated from POOL,
