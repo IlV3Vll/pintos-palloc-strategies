@@ -72,6 +72,7 @@ void palloc_init(size_t user_page_limit)
 
 static size_t palloc_scan_next_and_flip(struct pool *pool, size_t page_cnt);
 static size_t palloc_scan_best_and_flip(struct pool *pool, size_t page_cnt);
+static size_t palloc_buddy_and_flip(struct pool *pool, size_t page_cnt);
 
 /* Obtains and returns a group of PAGE_CNT contiguous free pages.
    If PAL_USER is set, the pages are obtained from the user pool,
@@ -93,16 +94,23 @@ palloc_get_multiple(enum palloc_flags flags, size_t page_cnt)
 
     if (palloc_mode == PAL_FIRST_FIT)
         page_idx = bitmap_scan_and_flip(pool->used_map, 0, page_cnt, false);
-    else if(palloc_mode == PAL_NEXT_FIT){
+    else if (palloc_mode == PAL_NEXT_FIT){
         page_idx = palloc_scan_next_and_flip(pool, page_cnt);
 
-        if(page_idx != BITMAP_ERROR)
+        if(page_idx != BITMAP_ERROR){
             pool->next_fit_idx = page_idx + page_cnt;
+            
             if (pool->next_fit_idx >= bitmap_size(pool->used_map))
                 pool->next_fit_idx = 0;
+        }
     }
     else if (palloc_mode == PAL_BEST_FIT)
         page_idx = palloc_scan_best_and_flip(pool, page_cnt);
+    else if (palloc_mode == PAL_BUDDY)
+        page_idx = palloc_buddy_and_flip(pool, page_cnt);
+    else
+        page_idx = BITMAP_ERROR;
+
 
     lock_release(&pool->lock);
 
@@ -167,6 +175,44 @@ static size_t palloc_scan_best_and_flip(struct pool *pool, size_t page_cnt)
 
     return best_idx;
 }
+static size_t bits_ceiling(size_t bits){
+    if (bits <= 1)
+        return 1;
+    bits--;
+
+    for(size_t shift = 1;
+        shift < sizeof(size_t) * 8;
+        shift <<= 1)
+        bits |= bits >> shift;
+    bits++;
+
+    return bits;
+}
+
+static size_t palloc_buddy_and_flip(struct pool *pool, size_t page_cnt){
+    struct bitmap* b = pool->used_map;
+    
+    size_t bit_cnt = bitmap_size(b);
+    size_t ceiled_cnt = bits_ceiling(page_cnt);
+    size_t count_of_buddies = bit_cnt / ceiled_cnt;
+
+    size_t idx = BITMAP_ERROR;
+
+    for(size_t i = 0; i < count_of_buddies; i++){
+        size_t start = i * ceiled_cnt;
+
+        if (bitmap_contains(b, start, ceiled_cnt, true))
+            continue;
+
+        idx = start;
+        bitmap_set_multiple(b, idx, ceiled_cnt, true);
+        break;
+    }
+
+    return idx;
+}
+
+
 /* Obtains a single free page and returns its kernel virtual
    address.
    If PAL_USER is set, the page is obtained from the user pool,
@@ -198,6 +244,10 @@ void palloc_free_multiple(void *pages, size_t page_cnt)
         NOT_REACHED();
 
     page_idx = pg_no(pages) - pg_no(pool->base);
+
+    if (palloc_mode == PAL_BUDDY){
+        page_cnt = bits_ceiling(page_cnt);
+    }
 
 #ifndef NDEBUG
     memset(pages, 0xcc, PGSIZE * page_cnt);
